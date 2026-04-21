@@ -580,6 +580,10 @@ def kernel_init_entity_fields(
     entities_geom_end: qd.types.ndarray(),
     entities_gravity_compensation: qd.types.ndarray(),
     entities_is_local_collision_mask: qd.types.ndarray(),
+    entities_cholesky_order: qd.types.ndarray(),
+    entities_root_entity_start: qd.types.ndarray(),
+    entities_root_entity_count: qd.types.ndarray(),
+    entities_root_entity_list: qd.types.ndarray(),
     # Quadrants variables
     entities_info: array_class.EntitiesInfo,
     entities_state: array_class.EntitiesState,
@@ -589,6 +593,7 @@ def kernel_init_entity_fields(
     static_rigid_sim_config: qd.template(),
 ):
     n_entities = entities_dof_start.shape[0]
+    n_roots = entities_root_entity_start.shape[0]
     _B = entities_state.hibernated.shape[1]
 
     qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
@@ -607,6 +612,13 @@ def kernel_init_entity_fields(
 
         entities_info.gravity_compensation[i_e] = entities_gravity_compensation[i_e]
         entities_info.is_local_collision_mask[i_e] = entities_is_local_collision_mask[i_e]
+        entities_info.cholesky_order[i_e] = entities_cholesky_order[i_e]
+        entities_info.root_entity_list[i_e] = entities_root_entity_list[i_e]
+
+    qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_r in range(n_roots):
+        entities_info.root_entity_start[i_r] = entities_root_entity_start[i_r]
+        entities_info.root_entity_count[i_r] = entities_root_entity_count[i_r]
 
     if qd.static(static_rigid_sim_config.use_hibernation):
         qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))

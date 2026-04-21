@@ -349,6 +349,24 @@ class RigidSolver(KinematicSolver):
         self._func_apply_coupling_force = func_apply_coupling_force
 
     def _build_static_config(self):
+        # Compute kinematic-tree root structure used by FK tree-level dispatch (P1.2).
+        # Each entity's tree is identified by the root_idx of its first link.
+        # Must run before _create_data_manager() which calls get_entities_info(solver).
+        if self._entities:
+            entity_root_link = [entity.links[0].root_idx for entity in self._entities]
+            seen_roots: dict = {}
+            tree_groups: list = []
+            for i_e, root_link in enumerate(entity_root_link):
+                if root_link not in seen_roots:
+                    seen_roots[root_link] = len(tree_groups)
+                    tree_groups.append([])
+                tree_groups[seen_roots[root_link]].append(i_e)
+            self._n_roots = len(tree_groups)
+            self._root_entity_groups = tree_groups  # list[list[int]]
+        else:
+            self._n_roots = 0
+            self._root_entity_groups = []
+
         static_rigid_sim_config = dict(
             backend=gs.backend,
             para_level=self.sim._para_level,
@@ -808,6 +826,26 @@ class RigidSolver(KinematicSolver):
 
         if self._entities:
             entities = self._entities
+            n_entities = len(entities)
+            # Sort entities by n_dofs descending so the tiled Cholesky factorisation
+            # dispatches workgroups with similar work amounts together, reducing the
+            # ~60% timing StdDev observed in kernel_10 (load imbalance from heterogeneous DOF counts).
+            entities_n_dofs = np.array([entity.n_dofs for entity in entities], dtype=gs.np_int)
+            cholesky_order = np.argsort(-entities_n_dofs).astype(gs.np_int)
+
+            # Build root-tree membership arrays (computed in _build_static_config).
+            root_entity_start_list: list[int] = []
+            root_entity_count_list: list[int] = []
+            root_entity_list_flat: list[int] = []
+            for group in self._root_entity_groups:
+                root_entity_start_list.append(len(root_entity_list_flat))
+                root_entity_count_list.append(len(group))
+                root_entity_list_flat.extend(group)
+            if not root_entity_start_list:
+                root_entity_start_list = list(range(n_entities))
+                root_entity_count_list = [1] * n_entities
+                root_entity_list_flat = list(range(n_entities))
+
             kernel_init_entity_fields(
                 entities_dof_start=np.array([entity.dof_start for entity in entities], dtype=gs.np_int),
                 entities_dof_end=np.array([entity.dof_end for entity in entities], dtype=gs.np_int),
@@ -821,6 +859,10 @@ class RigidSolver(KinematicSolver):
                 entities_is_local_collision_mask=np.array(
                     [entity.is_local_collision_mask for entity in entities], dtype=gs.np_bool
                 ),
+                entities_cholesky_order=cholesky_order,
+                entities_root_entity_start=np.array(root_entity_start_list, dtype=gs.np_int),
+                entities_root_entity_count=np.array(root_entity_count_list, dtype=gs.np_int),
+                entities_root_entity_list=np.array(root_entity_list_flat, dtype=gs.np_int),
                 # Quadrants variables
                 entities_info=self.entities_info,
                 entities_state=self.entities_state,
