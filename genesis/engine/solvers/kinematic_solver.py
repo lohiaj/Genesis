@@ -415,6 +415,7 @@ class KinematicSolver(Solver):
 
         if self._entities:
             entities = self._entities
+            n_entities = len(entities)
             kernel_init_entity_fields(
                 entities_dof_start=np.array([entity.dof_start for entity in entities], dtype=gs.np_int),
                 entities_dof_end=np.array([entity.dof_end for entity in entities], dtype=gs.np_int),
@@ -424,6 +425,10 @@ class KinematicSolver(Solver):
                 entities_geom_end=np.array([0 for entity in entities], dtype=gs.np_int),
                 entities_gravity_compensation=np.array([0.0 for entity in entities], dtype=gs.np_float),
                 entities_is_local_collision_mask=np.array([False for entity in entities], dtype=gs.np_bool),
+                entities_cholesky_order=np.arange(n_entities, dtype=gs.np_int),
+                entities_root_entity_start=np.arange(n_entities, dtype=gs.np_int),
+                entities_root_entity_count=np.ones(n_entities, dtype=gs.np_int),
+                entities_root_entity_list=np.arange(n_entities, dtype=gs.np_int),
                 entities_info=self.entities_info,
                 entities_state=self.entities_state,
                 links_info=self.links_info,

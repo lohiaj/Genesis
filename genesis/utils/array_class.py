@@ -1943,23 +1943,44 @@ class StructEntitiesInfo(metaclass=BASE_METACLASS):
     n_geoms: V_ANNOTATION
     gravity_compensation: V_ANNOTATION
     is_local_collision_mask: V_ANNOTATION
+    # Permutation of entity indices sorted by n_dofs descending.  Used by the
+    # tiled Cholesky factorisation to group similarly-sized workgroups together,
+    # reducing load imbalance (high timing variance in kernel_10 / kernel_25).
+    cholesky_order: V_ANNOTATION
+    # Root-tree membership arrays for forward-kinematics tree-level dispatch.
+    # root_entity_list[root_entity_start[i_root] .. +root_entity_count[i_root]]
+    # contains all entity indices that belong to kinematic tree i_root, in
+    # topological (parent-before-child) order.  Replaces the n_entities-thread
+    # dispatch (where (n_entities - n_roots) threads do nothing) with an
+    # n_roots-thread dispatch where each thread processes its whole subtree.
+    root_entity_start: V_ANNOTATION   # shape (n_roots,)
+    root_entity_count: V_ANNOTATION   # shape (n_roots,)
+    root_entity_list: V_ANNOTATION    # shape (n_entities,)
 
 
 def get_entities_info(solver):
-    shape = (solver.n_entities_,)
+    entity_shape = (solver.n_entities_,)
+    # n_roots is stored as a solver attribute after _build_root_tree_info() runs;
+    # fall back to n_entities as a conservative upper bound if not yet set.
+    n_roots = getattr(solver, "_n_roots", solver.n_entities_)
+    root_shape = (max(n_roots, 1),)  # avoid zero-size arrays
 
     return StructEntitiesInfo(
-        dof_start=V(dtype=gs.qd_int, shape=shape),
-        dof_end=V(dtype=gs.qd_int, shape=shape),
-        n_dofs=V(dtype=gs.qd_int, shape=shape),
-        link_start=V(dtype=gs.qd_int, shape=shape),
-        link_end=V(dtype=gs.qd_int, shape=shape),
-        n_links=V(dtype=gs.qd_int, shape=shape),
-        geom_start=V(dtype=gs.qd_int, shape=shape),
-        geom_end=V(dtype=gs.qd_int, shape=shape),
-        n_geoms=V(dtype=gs.qd_int, shape=shape),
-        gravity_compensation=V(dtype=gs.qd_float, shape=shape),
-        is_local_collision_mask=V(dtype=gs.qd_bool, shape=shape),
+        dof_start=V(dtype=gs.qd_int, shape=entity_shape),
+        dof_end=V(dtype=gs.qd_int, shape=entity_shape),
+        n_dofs=V(dtype=gs.qd_int, shape=entity_shape),
+        link_start=V(dtype=gs.qd_int, shape=entity_shape),
+        link_end=V(dtype=gs.qd_int, shape=entity_shape),
+        n_links=V(dtype=gs.qd_int, shape=entity_shape),
+        geom_start=V(dtype=gs.qd_int, shape=entity_shape),
+        geom_end=V(dtype=gs.qd_int, shape=entity_shape),
+        n_geoms=V(dtype=gs.qd_int, shape=entity_shape),
+        gravity_compensation=V(dtype=gs.qd_float, shape=entity_shape),
+        is_local_collision_mask=V(dtype=gs.qd_bool, shape=entity_shape),
+        cholesky_order=V(dtype=gs.qd_int, shape=entity_shape),
+        root_entity_start=V(dtype=gs.qd_int, shape=root_shape),
+        root_entity_count=V(dtype=gs.qd_int, shape=root_shape),
+        root_entity_list=V(dtype=gs.qd_int, shape=entity_shape),
     )
 
 

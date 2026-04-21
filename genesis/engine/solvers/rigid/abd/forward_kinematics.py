@@ -1183,6 +1183,8 @@ def func_forward_velocity(
     static_rigid_sim_config: qd.template(),
     is_backward: qd.template(),
 ):
+    BW = qd.static(is_backward)
+
     # This loop must be the outermost loop to be differentiable
     if qd.static(static_rigid_sim_config.use_hibernation):
         qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
@@ -1199,20 +1201,31 @@ def func_forward_velocity(
                 is_backward,
             )
     else:
+        # Tree-level dispatch (same rationale as func_update_cartesian_space):
+        # process each kinematic tree sequentially so cross-entity parent-child
+        # velocity dependencies are respected and no threads are wasted.
+        n_roots = entities_info.root_entity_start.shape[0]
         qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for i_e, i_b in qd.ndrange(entities_info.n_links.shape[0], links_state.pos.shape[1]):
-            func_forward_velocity_entity(
-                i_e,
-                i_b,
-                entities_info,
-                links_info,
-                links_state,
-                joints_info,
-                dofs_state,
-                rigid_global_info,
-                static_rigid_sim_config,
-                is_backward,
-            )
+        for i_root, i_b in qd.ndrange(n_roots, links_state.pos.shape[1]):
+            for j in (
+                range(entities_info.root_entity_count[i_root])
+                if qd.static(not BW)
+                else qd.static(range(static_rigid_sim_config.n_entities))
+            ):
+                if func_check_index_range(j, 0, entities_info.root_entity_count[i_root], BW):
+                    i_e = entities_info.root_entity_list[entities_info.root_entity_start[i_root] + j]
+                    func_forward_velocity_entity(
+                        i_e,
+                        i_b,
+                        entities_info,
+                        links_info,
+                        links_state,
+                        joints_info,
+                        dofs_state,
+                        rigid_global_info,
+                        static_rigid_sim_config,
+                        is_backward,
+                    )
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
@@ -1658,40 +1671,38 @@ def func_update_cartesian_space(
                 is_backward,
             )
     else:
-        # FIXME: Implement parallelization at tree-level (based on root_idx) instead of entity-level
+        # Tree-level dispatch: one GPU thread per (root_tree, batch).  Each thread
+        # iterates over all entities in its kinematic tree sequentially so that
+        # parent-link FK results are written before child links read them.
+        # This replaces the old n_entities-thread dispatch where only n_roots threads
+        # did real work (all other threads exited after the root_idx check).
+        n_roots = entities_info.root_entity_start.shape[0]
         qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for i_e, i_b in qd.ndrange(entities_info.n_links.shape[0], links_state.pos.shape[1]):
-            i_l_start = entities_info.link_start[i_e]
-            I_l_start = [i_l_start, i_b] if qd.static(static_rigid_sim_config.batch_links_info) else i_l_start
-            if links_info.root_idx[I_l_start] == i_l_start:
-                for j_e in (
-                    range(i_e, entities_info.n_links.shape[0])
-                    if qd.static(not BW)
-                    else qd.static(range(static_rigid_sim_config.n_entities))
-                ):
-                    if func_check_index_range(j_e, i_e, static_rigid_sim_config.n_entities, BW):
-                        j_l_start = entities_info.link_start[j_e]
-                        J_l_start = (
-                            [j_l_start, i_b] if qd.static(static_rigid_sim_config.batch_links_info) else j_l_start
-                        )
-                        if links_info.root_idx[J_l_start] == i_l_start:
-                            func_update_cartesian_space_entity(
-                                j_e,
-                                i_b,
-                                links_state,
-                                links_info,
-                                joints_state,
-                                joints_info,
-                                dofs_state,
-                                dofs_info,
-                                geoms_info,
-                                geoms_state,
-                                entities_info,
-                                rigid_global_info,
-                                static_rigid_sim_config,
-                                force_update_fixed_geoms,
-                                is_backward,
-                            )
+        for i_root, i_b in qd.ndrange(n_roots, links_state.pos.shape[1]):
+            for j in (
+                range(entities_info.root_entity_count[i_root])
+                if qd.static(not BW)
+                else qd.static(range(static_rigid_sim_config.n_entities))
+            ):
+                if func_check_index_range(j, 0, entities_info.root_entity_count[i_root], BW):
+                    j_e = entities_info.root_entity_list[entities_info.root_entity_start[i_root] + j]
+                    func_update_cartesian_space_entity(
+                        j_e,
+                        i_b,
+                        links_state,
+                        links_info,
+                        joints_state,
+                        joints_info,
+                        dofs_state,
+                        dofs_info,
+                        geoms_info,
+                        geoms_state,
+                        entities_info,
+                        rigid_global_info,
+                        static_rigid_sim_config,
+                        force_update_fixed_geoms,
+                        is_backward,
+                    )
 
 
 @qd.kernel(fastcache=gs.use_fastcache)

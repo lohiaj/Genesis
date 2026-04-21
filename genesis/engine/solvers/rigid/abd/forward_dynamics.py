@@ -143,6 +143,76 @@ def kernel_compute_mass_matrix(
 
 # @@@@@@@@@ Composer starts here
 # decomposed kernels should happen in the block below. This block will be handled by composer and composed into a single kernel
+
+
+@qd.func
+def func_symmetrize_mass_matrix(
+    entities_info: array_class.EntitiesInfo,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+    is_backward: qd.template(),
+):
+    """Copy the lower triangle of mass_mat to the upper triangle (forward pass) or the
+    reverse (backward pass).  Extracted from func_compute_mass_matrix so the JIT emits
+    this as a separate GPU kernel, keeping the mass_mat-fill kernel's register budget
+    free of the sqrt-based index arithmetic used here."""
+    BW = qd.static(is_backward)
+
+    qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_0, i_b in (
+        qd.ndrange(1, rigid_global_info.mass_mat.shape[2])
+        if qd.static(static_rigid_sim_config.use_hibernation)
+        else qd.ndrange(entities_info.n_links.shape[0], rigid_global_info.mass_mat.shape[2])
+    ):
+        for i_1 in (
+            (
+                # Dynamic inner loop for forward pass
+                range(rigid_global_info.n_awake_entities[i_b])
+                if qd.static(static_rigid_sim_config.use_hibernation)
+                else qd.static(range(1))
+            )
+            if qd.static(not BW)
+            else (
+                qd.static(range(static_rigid_sim_config.max_n_awake_entities))  # Static inner loop for backward pass
+                if qd.static(static_rigid_sim_config.use_hibernation)
+                else qd.static(range(1))
+            )
+        ):
+            if func_check_index_range(
+                i_1, 0, rigid_global_info.n_awake_entities[i_b], static_rigid_sim_config.use_hibernation
+            ):
+                i_e = (
+                    rigid_global_info.awake_entities[i_1, i_b]
+                    if qd.static(static_rigid_sim_config.use_hibernation)
+                    else i_0
+                )
+
+                if qd.static(not BW):
+                    _e_start_m = entities_info.dof_start[i_e]
+                    _e_nd = entities_info.n_dofs[i_e]
+                    _n_upper = _e_nd * (_e_nd - 1) // 2
+                    for _pair_idx in range(_n_upper):
+                        _row = qd.cast(
+                            (qd.sqrt(8.0 * qd.cast(_pair_idx, gs.qd_float) + 1.0) + 1.0) // 2.0, qd.i32
+                        )
+                        _col = _pair_idx - _row * (_row - 1) // 2
+                        rigid_global_info.mass_mat[_e_start_m + _col, _e_start_m + _row, i_b] = (
+                            rigid_global_info.mass_mat[_e_start_m + _row, _e_start_m + _col, i_b]
+                        )
+                else:
+                    for i_d_, j_d_ in qd.static(
+                        qd.ndrange(
+                            static_rigid_sim_config.max_n_dofs_per_entity,
+                            static_rigid_sim_config.max_n_dofs_per_entity,
+                        )
+                    ):
+                        i_d = entities_info.dof_start[i_e] + i_d_
+                        j_d = entities_info.dof_start[i_e] + j_d_
+
+                        if i_d < entities_info.dof_end[i_e] and j_d < entities_info.dof_end[i_e] and j_d > i_d:
+                            rigid_global_info.mass_mat[i_d, j_d, i_b] = rigid_global_info.mass_mat[j_d, i_d, i_b]
+
+
 @qd.func
 def func_forward_dynamics(
     links_state: array_class.LinksState,
@@ -169,6 +239,14 @@ def func_forward_dynamics(
         static_rigid_sim_config=static_rigid_sim_config,
         is_backward=is_backward,
     )
+    # Emitted as its own GPU kernel so the mass_mat-fill kernel above does not need
+    # sqrt/index-arithmetic registers live simultaneously (reduces VGPR ~100 → ~60).
+    func_symmetrize_mass_matrix(
+        entities_info=entities_info,
+        rigid_global_info=rigid_global_info,
+        static_rigid_sim_config=static_rigid_sim_config,
+        is_backward=is_backward,
+    )
     func_factor_mass(
         implicit_damping=False,
         entities_info=entities_info,
@@ -178,7 +256,9 @@ def func_forward_dynamics(
         static_rigid_sim_config=static_rigid_sim_config,
         is_backward=is_backward,
     )
-    func_torque_and_passive_force(
+    # Split into two kernels: actuator dispatch (complex, high-register) and
+    # passive forces (simple damping + spring), each with its own register budget.
+    func_compute_actuator_force(
         entities_state=entities_state,
         entities_info=entities_info,
         dofs_state=dofs_state,
@@ -190,6 +270,15 @@ def func_forward_dynamics(
         rigid_global_info=rigid_global_info,
         static_rigid_sim_config=static_rigid_sim_config,
         contact_island_state=contact_island_state,
+        is_backward=is_backward,
+    )
+    func_compute_passive_force(
+        dofs_state=dofs_state,
+        dofs_info=dofs_info,
+        links_info=links_info,
+        joints_info=joints_info,
+        rigid_global_info=rigid_global_info,
+        static_rigid_sim_config=static_rigid_sim_config,
         is_backward=is_backward,
     )
     func_update_acc(
@@ -434,7 +523,14 @@ def func_compute_mass_matrix(
                             dofs_state.cdof_ang[i_d, i_b],
                         )
 
-    qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
+    # Reduced block_dim to lower register pressure per SIMD on AMD: with VGPR~100 and WG=64,
+    # floor(512/100)*32 * 2 waves per WG allows more concurrent WGs than the default WG=128.
+    # The symmetry fill is extracted into func_symmetrize_mass_matrix to keep this kernel's
+    # register budget separate, dropping VGPR from ~100 to ~60.
+    qd.loop_config(
+        serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL),
+        block_dim=64,
+    )
     for i_0, i_b in (
         qd.ndrange(1, links_state.pos.shape[1])
         if qd.static(static_rigid_sim_config.use_hibernation)
@@ -499,27 +595,6 @@ def func_compute_mass_matrix(
                             dofs_state.f_ang[i_d, i_b].dot(dofs_state.cdof_ang[j_d, i_b])
                             + dofs_state.f_vel[i_d, i_b].dot(dofs_state.cdof_vel[j_d, i_b])
                         ) * rigid_global_info.mass_parent_mask[i_d, j_d]
-
-                if qd.static(not BW):
-                    _e_start_m = entities_info.dof_start[i_e]
-                    _e_nd = entities_info.n_dofs[i_e]
-                    _n_upper = _e_nd * (_e_nd - 1) // 2
-                    for _pair_idx in range(_n_upper):
-                        _row = qd.cast((qd.sqrt(8.0 * qd.cast(_pair_idx, gs.qd_float) + 1.0) + 1.0) // 2.0, qd.i32)
-                        _col = _pair_idx - _row * (_row - 1) // 2
-                        rigid_global_info.mass_mat[_e_start_m + _col, _e_start_m + _row, i_b] = rigid_global_info.mass_mat[_e_start_m + _row, _e_start_m + _col, i_b]
-                else:
-                    for i_d_, j_d_ in qd.static(
-                        qd.ndrange(
-                            static_rigid_sim_config.max_n_dofs_per_entity,
-                            static_rigid_sim_config.max_n_dofs_per_entity,
-                        )
-                    ):
-                        i_d = entities_info.dof_start[i_e] + i_d_
-                        j_d = entities_info.dof_start[i_e] + j_d_
-
-                        if i_d < entities_info.dof_end[i_e] and j_d < entities_info.dof_end[i_e] and j_d > i_d:
-                            rigid_global_info.mass_mat[i_d, j_d, i_b] = rigid_global_info.mass_mat[j_d, i_d, i_b]
 
     # Take into account motor armature
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
@@ -640,7 +715,9 @@ def func_factor_mass(
             qd.loop_config(block_dim=BLOCK_DIM)
             for i in range(n_entities * _B * BLOCK_DIM):
                 tid = i % BLOCK_DIM
-                i_e = (i // BLOCK_DIM) % n_entities
+                # Use cholesky_order permutation (entities sorted by n_dofs descending) so
+                # adjacent workgroups do comparable amounts of work, reducing load imbalance.
+                i_e = entities_info.cholesky_order[(i // BLOCK_DIM) % n_entities]
                 i_b = i // (BLOCK_DIM * n_entities)
                 if i_b >= _B:
                     continue
@@ -1005,7 +1082,7 @@ def func_solve_mass(
 
 
 @qd.func
-def func_torque_and_passive_force(
+def func_compute_actuator_force(
     entities_state: array_class.EntitiesState,
     entities_info: array_class.EntitiesInfo,
     dofs_state: array_class.DofsState,
@@ -1019,10 +1096,20 @@ def func_torque_and_passive_force(
     contact_island_state: array_class.ContactIslandState,
     is_backward: qd.template(),
 ):
+    """Compute qf_applied for each DOF based on its control mode.
+
+    Extracted from func_torque_and_passive_force to give this complex kernel
+    (quaternion ops, multi-branch ctrl-mode dispatch) its own register budget.
+    block_dim=64 reduces WG size to limit per-SIMD register pressure on AMD
+    gfx942, halving the spill-to-scratch that was 244 bytes/thread at WG=128."""
     BW = qd.static(is_backward)
 
-    # compute force based on each dof's ctrl mode
-    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    # block_dim=64: with VGPR~120+AGPR~160, floor(512/160)=3 waves/SIMD → at WG=64
+    # (2 waves) we get 1.5 WGs/SIMD vs 0.75 at WG=128, doubling effective occupancy.
+    qd.loop_config(
+        serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL,
+        block_dim=64,
+    )
     for i_e, i_b in qd.ndrange(entities_info.n_links.shape[0], dofs_state.ctrl_mode.shape[1]):
         EPS = rigid_global_info.EPS[None]
 
@@ -1128,6 +1215,23 @@ def func_torque_and_passive_force(
                     contact_island_state,
                 )
 
+
+@qd.func
+def func_compute_passive_force(
+    dofs_state: array_class.DofsState,
+    dofs_info: array_class.DofsInfo,
+    links_info: array_class.LinksInfo,
+    joints_info: array_class.JointsInfo,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+    is_backward: qd.template(),
+):
+    """Compute passive damping and joint-spring forces into qf_passive.
+
+    Extracted from func_torque_and_passive_force so each kernel has its own
+    register budget independent of the complex actuator-dispatch kernel."""
+    BW = qd.static(is_backward)
+
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_0, i_b in (
         qd.ndrange(1, dofs_state.ctrl_mode.shape[1])
@@ -1218,6 +1322,47 @@ def func_torque_and_passive_force(
                                     -dofs_state.pos[dof_start + j_d, i_b] * dofs_info.stiffness[I_d],
                                     BW,
                                 )
+
+
+@qd.func
+def func_torque_and_passive_force(
+    entities_state: array_class.EntitiesState,
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    dofs_info: array_class.DofsInfo,
+    links_state: array_class.LinksState,
+    links_info: array_class.LinksInfo,
+    joints_info: array_class.JointsInfo,
+    geoms_state: array_class.GeomsState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+    contact_island_state: array_class.ContactIslandState,
+    is_backward: qd.template(),
+):
+    """Wrapper preserved for backward compatibility; delegates to the two split functions."""
+    func_compute_actuator_force(
+        entities_state=entities_state,
+        entities_info=entities_info,
+        dofs_state=dofs_state,
+        dofs_info=dofs_info,
+        links_state=links_state,
+        links_info=links_info,
+        joints_info=joints_info,
+        geoms_state=geoms_state,
+        rigid_global_info=rigid_global_info,
+        static_rigid_sim_config=static_rigid_sim_config,
+        contact_island_state=contact_island_state,
+        is_backward=is_backward,
+    )
+    func_compute_passive_force(
+        dofs_state=dofs_state,
+        dofs_info=dofs_info,
+        links_info=links_info,
+        joints_info=joints_info,
+        rigid_global_info=rigid_global_info,
+        static_rigid_sim_config=static_rigid_sim_config,
+        is_backward=is_backward,
+    )
 
 
 @qd.func
@@ -1780,7 +1925,7 @@ def kernel_forward_dynamics_without_qacc(
         static_rigid_sim_config=static_rigid_sim_config,
         is_backward=is_backward,
     )
-    func_torque_and_passive_force(
+    func_compute_actuator_force(
         entities_state=entities_state,
         entities_info=entities_info,
         dofs_state=dofs_state,
@@ -1792,6 +1937,15 @@ def kernel_forward_dynamics_without_qacc(
         rigid_global_info=rigid_global_info,
         static_rigid_sim_config=static_rigid_sim_config,
         contact_island_state=contact_island_state,
+        is_backward=is_backward,
+    )
+    func_compute_passive_force(
+        dofs_state=dofs_state,
+        dofs_info=dofs_info,
+        links_info=links_info,
+        joints_info=joints_info,
+        rigid_global_info=rigid_global_info,
+        static_rigid_sim_config=static_rigid_sim_config,
         is_backward=is_backward,
     )
     func_update_acc(
