@@ -682,6 +682,24 @@ def func_factor_mass(
 
                     sh_pivot = qd.simt.block.SharedArray((BLOCK_DIM,), gs.qd_float)
 
+                    # Precomputed (row, col) decode table for the balanced rank-1 update.
+                    # The flat index -> lower-triangular (r, c) mapping was previously computed
+                    # inline via a `qd.sqrt` per inner-loop iteration. On CDNA3 (MI300X) the
+                    # `v_sqrt_f32` latency is materially higher than on NVIDIA, and that decode
+                    # was firing once per (`_upd`, `j`) per thread -- one of the dominant costs
+                    # of this kernel on AMD. Building the table once in LDS and looking it up
+                    # is bit-exact equivalent to the previous decode and removes the sqrt from
+                    # the hot path entirely. (r, c) is packed as (r << 16) | c which fits any
+                    # plausible MAX_DOFS_PER_ENTITY (<= 65535).
+                    LOWER_TRI_LEN = qd.static(MAX_DOFS_PER_ENTITY * (MAX_DOFS_PER_ENTITY + 1) // 2)
+                    sh_decode = qd.simt.block.SharedArray((LOWER_TRI_LEN,), qd.i32)
+                    _idx = tid
+                    while _idx < LOWER_TRI_LEN:
+                        _r0, _c0 = _linear_to_lower_tri(_idx)
+                        sh_decode[_idx] = (_r0 << 16) | _c0
+                        _idx = _idx + BLOCK_DIM
+                    qd.simt.block.sync()
+
                     for j in range(n_dofs):
                         i_d_ = n_dofs - j - 1
                         i_d = entity_dof_end - j - 1
@@ -701,10 +719,9 @@ def func_factor_mass(
                         _n_updates = i_d_ * (i_d_ + 1) // 2
                         _upd = tid
                         while _upd < _n_updates:
-                            _r = qd.cast((qd.sqrt(8.0 * qd.cast(_upd, gs.qd_float) + 1.0) - 1.0) * 0.5, qd.i32)
-                            if _r * (_r + 1) // 2 > _upd:
-                                _r = _r - 1
-                            _c = _upd - _r * (_r + 1) // 2
+                            _code = sh_decode[_upd]
+                            _r = _code >> 16
+                            _c = _code & 0xFFFF
                             mass_mat[_r, _c] = mass_mat[_r, _c] - sh_pivot[_r] * D_inv * sh_pivot[_c]
                             _upd = _upd + BLOCK_DIM
 
