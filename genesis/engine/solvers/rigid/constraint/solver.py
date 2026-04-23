@@ -613,7 +613,18 @@ def add_collision_constraints(
     n_dofs = dofs_state.ctrl_mode.shape[0]
     max_contact_pairs = collider_state.contact_data.link_a.shape[0]
 
-    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    # Keeps PR #10's flat iteration + deterministic n_con indexing (no atomic).
+    # Adds three orthogonal inner-loop optimizations:
+    #   (1) chain-walk dedup: walk parent chain once per contact, accumulate 4
+    #       friction-pyramid row contributions in a single pass (was: 4 walks).
+    #   (2) identity-quat inline: qd_transform_motion_by_trans_quat is called
+    #       with an identity quat so the ang return is unused and vel collapses
+    #       to vel = cdot_vel - t_pos.cross(cdof_ang). ~60 -> ~9 flops per DoF.
+    #   (3) t_pos hoisted out of the per-DoF loop (link-invariant); falls out
+    #       naturally from the dedup rewrite.
+    # Also sets block_dim=64 so the AMD backend doesn't silently promote from
+    # a sub-wave default.
+    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=64)
     for flat_idx in range(max_contact_pairs * _B):
         i_b = flat_idx % _B
         i_col = flat_idx // _B
@@ -640,67 +651,78 @@ def add_collision_constraints(
             if link_b > -1:
                 invweight = invweight + links_info.invweight[link_b_maybe_batch][0]
 
-            for i in range(4):
-                d = (2 * (i % 2) - 1) * (d1 if i < 2 else d2)
-                n = d * contact_data_friction - contact_data_normal
+            n_con_base = collision_con_start + i_col * 4
 
-                n_con = collision_con_start + i_col * 4 + i
+            # 4 row directions: n_j = sgn_j * dir_j * friction - normal, dir_j = d1 for j<2 else d2
+            n_j = qd.Matrix.zero(gs.qd_float, 4, 3)
+            for j in qd.static(range(4)):
+                sgn_j = gs.qd_float(2.0 * (j % 2) - 1.0)
+                dir_j = d1 if qd.static(j < 2) else d2
+                for k in qd.static(range(3)):
+                    n_j[j, k] = sgn_j * dir_j[k] * contact_data_friction - contact_data_normal[k]
+
+            # Zero out all 4 constraint rows (sparse path iterates its existing index list).
+            if qd.static(static_rigid_sim_config.sparse_solve):
+                for j in qd.static(range(4)):
+                    for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con_base + j, i_b]):
+                        i_d_z = constraint_state.jac_relevant_dofs[n_con_base + j, i_d_, i_b]
+                        constraint_state.jac[n_con_base + j, i_d_z, i_b] = gs.qd_float(0.0)
+            else:
+                for i_d in range(n_dofs):
+                    for j in qd.static(range(4)):
+                        constraint_state.jac[n_con_base + j, i_d, i_b] = gs.qd_float(0.0)
+
+            jac_qvel = qd.Vector.zero(gs.qd_float, 4)
+            con_n_relevant_dofs = 0
+
+            for i_ab in range(2):
+                sign = gs.qd_float(-1.0)
+                link = link_a
+                if i_ab == 1:
+                    sign = gs.qd_float(1.0)
+                    link = link_b
+                while link > -1:
+                    link_maybe_batch = [link, i_b] if qd.static(static_rigid_sim_config.batch_links_info) else link
+                    # t_pos is link-invariant (same for every DoF under this link): hoist out of per-DoF loop.
+                    t_pos = contact_data_pos - links_state.root_COM[link, i_b]
+                    # Reverse order to match the existing "descending jac_relevant_dofs" invariant.
+                    for i_d_ in range(links_info.n_dofs[link_maybe_batch]):
+                        i_d = links_info.dof_end[link_maybe_batch] - 1 - i_d_
+
+                        cdof_ang = dofs_state.cdof_ang[i_d, i_b]
+                        cdot_vel = dofs_state.cdof_vel[i_d, i_b]
+                        # identity-quat inline of qd_transform_motion_by_trans_quat.
+                        diff = sign * (cdot_vel - t_pos.cross(cdof_ang))
+                        dof_vel = dofs_state.vel[i_d, i_b]
+
+                        # Accumulate all 4 friction-row contributions in one pass over this DoF.
+                        for j in qd.static(range(4)):
+                            jac_ij = diff[0] * n_j[j, 0] + diff[1] * n_j[j, 1] + diff[2] * n_j[j, 2]
+                            jac_qvel[j] = jac_qvel[j] + jac_ij * dof_vel
+                            constraint_state.jac[n_con_base + j, i_d, i_b] = (
+                                constraint_state.jac[n_con_base + j, i_d, i_b] + jac_ij
+                            )
+                        if qd.static(static_rigid_sim_config.sparse_solve):
+                            for j in qd.static(range(4)):
+                                constraint_state.jac_relevant_dofs[n_con_base + j, con_n_relevant_dofs, i_b] = i_d
+                            con_n_relevant_dofs = con_n_relevant_dofs + 1
+
+                    link = links_info.parent_idx[link_maybe_batch]
+
+            # Finalize diag/aref/efc_D for all 4 rows (shared friction^2 + invweight).
+            f2 = contact_data_friction * contact_data_friction
+            diag_base = invweight + f2 * invweight
+            for j in qd.static(range(4)):
                 if qd.static(static_rigid_sim_config.sparse_solve):
-                    for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
-                        i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
-                        constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
-                else:
-                    for i_d in range(n_dofs):
-                        constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
-
-                con_n_relevant_dofs = 0
-                jac_qvel = gs.qd_float(0.0)
-                for i_ab in range(2):
-                    sign = gs.qd_float(-1.0)
-                    link = link_a
-                    if i_ab == 1:
-                        sign = gs.qd_float(1.0)
-                        link = link_b
-
-                    while link > -1:
-                        link_maybe_batch = [link, i_b] if qd.static(static_rigid_sim_config.batch_links_info) else link
-
-                        # reverse order to make sure dofs in each row of self.jac_relevant_dofs is strictly descending
-                        for i_d_ in range(links_info.n_dofs[link_maybe_batch]):
-                            i_d = links_info.dof_end[link_maybe_batch] - 1 - i_d_
-
-                            cdof_ang = dofs_state.cdof_ang[i_d, i_b]
-                            cdot_vel = dofs_state.cdof_vel[i_d, i_b]
-
-                            t_quat = gu.qd_identity_quat()
-                            t_pos = contact_data_pos - links_state.root_COM[link, i_b]
-                            _, vel = gu.qd_transform_motion_by_trans_quat(cdof_ang, cdot_vel, t_pos, t_quat)
-
-                            diff = sign * vel
-                            jac = diff @ n
-                            jac_qvel = jac_qvel + jac * dofs_state.vel[i_d, i_b]
-                            constraint_state.jac[n_con, i_d, i_b] = constraint_state.jac[n_con, i_d, i_b] + jac
-
-                            if qd.static(static_rigid_sim_config.sparse_solve):
-                                constraint_state.jac_relevant_dofs[n_con, con_n_relevant_dofs, i_b] = i_d
-                                con_n_relevant_dofs = con_n_relevant_dofs + 1
-
-                        link = links_info.parent_idx[link_maybe_batch]
-
-                if qd.static(static_rigid_sim_config.sparse_solve):
-                    constraint_state.jac_n_relevant_dofs[n_con, i_b] = con_n_relevant_dofs
-                    _sort_relevant_dofs_descending(constraint_state, n_con, con_n_relevant_dofs, i_b)
+                    constraint_state.jac_n_relevant_dofs[n_con_base + j, i_b] = con_n_relevant_dofs
+                    _sort_relevant_dofs_descending(constraint_state, n_con_base + j, con_n_relevant_dofs, i_b)
                 imp, aref = gu.imp_aref(
-                    contact_data_sol_params, -contact_data_penetration, jac_qvel, -contact_data_penetration
+                    contact_data_sol_params, -contact_data_penetration, jac_qvel[j], -contact_data_penetration
                 )
-
-                diag = invweight + contact_data_friction * contact_data_friction * invweight
-                diag *= 2 * contact_data_friction * contact_data_friction * (1 - imp) / imp
-                diag = qd.max(diag, EPS)
-
-                constraint_state.diag[n_con, i_b] = diag
-                constraint_state.aref[n_con, i_b] = aref
-                constraint_state.efc_D[n_con, i_b] = 1 / diag
+                diag = qd.max(diag_base * 2 * f2 * (1 - imp) / imp, EPS)
+                constraint_state.diag[n_con_base + j, i_b] = diag
+                constraint_state.aref[n_con_base + j, i_b] = aref
+                constraint_state.efc_D[n_con_base + j, i_b] = 1 / diag
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
@@ -1212,7 +1234,8 @@ def add_joint_limit_constraints(
     n_dofs = dofs_state.ctrl_mode.shape[0]
 
     # TODO: sparse mode
-    qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
+    # block_dim=64 so AMD backend does not silently promote from a sub-wave default.
+    qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL), block_dim=64)
     for i_b in range(_B):
         for i_l in range(n_links):
             I_l = [i_l, i_b] if qd.static(static_rigid_sim_config.batch_links_info) else i_l
@@ -1272,8 +1295,10 @@ def add_frictionloss_constraints(
     # TODO: sparse mode
     # FIXME: The condition `if dofs_info.frictionloss[I_d] > EPS:` is not correctly evaluated on Apple Metal
     # if `serialize=True`...
+    # block_dim=64 so AMD backend does not silently promote from a sub-wave default.
     qd.loop_config(
-        serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL and gs.backend != gs.metal)
+        serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL and gs.backend != gs.metal),
+        block_dim=64,
     )
     for i_b in range(_B):
         constraint_state.n_constraints_frictionloss[i_b] = 0
